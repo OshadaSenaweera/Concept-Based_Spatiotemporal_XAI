@@ -3,6 +3,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+### Extract data files should be put into folder named "data" in working directory
+
 #Load the MeteoNet coordinate grid
 coords = np.load("data/coords/radar_coords_NW.npz")
 lats = coords["lats"]
@@ -164,11 +166,340 @@ def aggregate_2x2(data):
 
     return data_200.astype(np.float32)
 
+# function to load data in a memory-conscious manner
+def load_and_process_radar(
+    folder,
+    row_min,
+    row_max,
+    col_min,
+    col_max
+):
 
+    folder = Path(folder)
 
+    # Only rainfall files
+    files = sorted(
+        folder.glob("rainfall_NW_*.npz")
+    )
 
+    if len(files) == 0:
+        raise FileNotFoundError(
+            f"No rainfall_NW_*.npz files found in {folder}"
+        )
 
+    print("Number of radar files:", len(files))
 
+    # --------------------------------------------------
+    # PASS 1:
+    # Determine total number of radar frames
+    # --------------------------------------------------
+
+    frame_counts = []
+    file_date_ranges = []
+
+    total_frames = 0
+
+    for file in files:
+
+        with np.load(file, allow_pickle=True) as radar:
+
+            dates = pd.to_datetime(
+                radar["dates"]
+            )
+
+            n_frames = len(dates)
+
+        frame_counts.append(n_frames)
+
+        file_date_ranges.append(
+            (
+                file.name,
+                dates.min(),
+                dates.max()
+            )
+        )
+
+        total_frames += n_frames
+
+    print("Total radar frames:", total_frames)
+
+    # --------------------------------------------------
+    # Allocate final output once
+    # --------------------------------------------------
+
+    radar_data = np.empty(
+        (total_frames, 200, 200),
+        dtype=np.float32
+    )
+
+    all_dates = np.empty(
+        total_frames,
+        dtype="datetime64[ns]"
+    )
+
+    # --------------------------------------------------
+    # PASS 2:
+    # Load -> crop -> fill -> aggregate -> store
+    # --------------------------------------------------
+
+    start = 0
+
+    for file, n_frames in zip(files, frame_counts):
+
+        print("\nProcessing:", file.name)
+
+        with np.load(file, allow_pickle=True) as radar:
+
+            # Crop before loading unnecessary spatial area
+            values = radar["data"][
+                :,
+                row_min:row_max,
+                col_min:col_max
+            ]
+
+            dates = pd.to_datetime(
+                radar["dates"]
+            )
+
+        if len(values) != len(dates):
+            raise ValueError(
+                f"Data/date mismatch in {file.name}: "
+                f"{len(values)} frames and "
+                f"{len(dates)} dates"
+            )
+
+        print(
+            "  Cropped:",
+            values.shape
+        )
+
+        # Count missing pixels before filling
+        n_missing = np.sum(values == -1)
+
+        print(
+            "  Missing pixels:",
+            n_missing
+        )
+
+        # Fill missing radar pixels
+        values = fill_missing_neighbor_mean(
+            values
+        )
+
+        # Check
+        remaining_missing = np.sum(
+            values == -1
+        )
+
+        print(
+            "  Remaining -1 values:",
+            remaining_missing
+        )
+
+        # 400x400 -> 200x200
+        values_200 = aggregate_2x2(
+            values
+        )
+
+        print(
+            "  Aggregated:",
+            values_200.shape
+        )
+
+        end = start + n_frames
+
+        radar_data[
+            start:end
+        ] = values_200
+
+        all_dates[
+            start:end
+        ] = dates.to_numpy()
+
+        print(
+            "  Dates:",
+            dates.min(),
+            "to",
+            dates.max()
+        )
+
+        start = end
+
+        # Explicitly release large temporary arrays
+        del values
+        del values_200
+
+    radar_dates = pd.DatetimeIndex(
+        all_dates
+    )
+
+    return radar_data, radar_dates
+
+#Load the processed dataset
+radar_data, radar_dates = load_and_process_radar(
+    folder="data",
+    row_min=row_min,
+    row_max=row_max,
+    col_min=col_min,
+    col_max=col_max
+)
+
+# check the loaded datset
+print("\nFinal dataset")
+print("------------------------")
+
+print("Radar shape:", radar_data.shape)
+print("dtype:", radar_data.dtype)
+
+print(
+    "Period:",
+    radar_dates.min(),
+    "to",
+    radar_dates.max()
+)
+
+print(
+    "Minimum radar value:",
+    radar_data.min()
+)
+
+print(
+    "Maximum radar value:",
+    radar_data.max()
+)
+
+# Plot one processed radar frame
+sample = 1000
+
+fig, ax = plt.subplots(
+    figsize=(8, 7)
+)
+
+mesh = ax.pcolormesh(
+    lon_200,
+    lat_200,
+    radar_data[sample],
+    shading="auto"
+)
+
+plt.colorbar(
+    mesh,
+    ax=ax,
+    label="Radar value"
+)
+
+ax.set_xlabel("Longitude")
+ax.set_ylabel("Latitude")
+
+ax.set_title(
+    f"MeteoNet radar\n"
+    f"{radar_dates[sample]}"
+)
+
+plt.show()
+
+#convert data into mm (milimeters)
+radar_data /= np.float32(100.0)
+
+# get average daily rainfall
+frame_mean = radar_data.mean(axis=(1, 2), dtype=np.float64)
+
+days = radar_dates.normalize()
+
+daily_df = pd.DataFrame({
+    "date": days,
+    "frame_mean": frame_mean
+})
+
+daily_summary = (
+    daily_df
+    .groupby("date")
+    .agg(
+        rainfall_score=("frame_mean", "mean"),
+        n_scans=("frame_mean", "size")
+    )
+    .reset_index()
+)
+
+# get top 100 tainy days radar frames only
+top_100_days = (
+    daily_summary
+    .sort_values("rainfall_score", ascending=False)
+    .head(100)
+    .reset_index(drop=True)
+)
+selected_days = top_100_days["date"]
+mask = days.isin(selected_days)
+selected_idx = np.flatnonzero(mask)
+
+import gc
+
+selected_shape = (
+    len(selected_idx),
+    radar_data.shape[1],
+    radar_data.shape[2]
+)
+
+print("Selected shape:", selected_shape)
+
+radar_selected = np.memmap(
+    "radar_selected.dat",
+    dtype=np.float32,
+    mode="w+",
+    shape=selected_shape
+)
+
+chunk_size = 500
+
+for start in range(0, len(selected_idx), chunk_size):
+    end = min(start + chunk_size, len(selected_idx))
+
+    idx_chunk = selected_idx[start:end]
+
+    radar_selected[start:end] = radar_data[idx_chunk]
+
+    print(f"Copied {end} / {len(selected_idx)} frames")
+
+radar_selected.flush()
+
+### Save Data
+dates_selected = radar_dates[selected_idx]
+
+np.save(
+    "radar_selected_dates.npy",
+    dates_selected.to_numpy()
+)
+
+radar_selected = np.memmap(
+    "radar_selected.dat",
+    dtype=np.float32,
+    mode="r",
+    shape=(28800, 200, 200)
+)
+
+np.save(
+    "radar_selected.npy",
+    radar_selected
+) 
+
+np.save(
+    "radar_dates_selected.npy",
+    np.asarray(dates_selected, dtype="datetime64[ns]")
+)
+np.save(
+    "lat_200.npy",
+    lat_200.astype(np.float32)
+)
+
+np.save(
+    "lon_200.npy",
+    lon_200.astype(np.float32)
+)
+
+top_100_days.to_csv(
+    "top_100_rainy_days.csv",
+    index=False
+)
 
 
 
