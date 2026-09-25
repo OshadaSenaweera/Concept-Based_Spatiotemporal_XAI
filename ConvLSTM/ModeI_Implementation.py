@@ -1,121 +1,451 @@
-import tensorflow as tf
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
 
-# load data
-data_dir = "data"
+
+# ============================================================
+# Configuration
+# ============================================================
+
+DATA_DIR = Path("processed")
+MODEL_DIR = Path("models/convlstm_30min")
+
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+# Temporal configuration
+INPUT_STEPS = 6
+HORIZON_STEPS = 6
+
+# Target offset relative to the first input frame
+#
+# Inputs:
+#   i, i+1, ..., i+5
+#
+# Target:
+#   i+11
+#
+# Therefore the target is 6 five-minute steps
+# (30 minutes) after the final input frame.
+TARGET_OFFSET = INPUT_STEPS - 1 + HORIZON_STEPS
+
+TIME_INTERVAL_MINUTES = 5
+
+# Spatial dimensions
+HEIGHT = 200
+WIDTH = 200
+CHANNELS = 1
+
+# Dataset split by selected days
+N_TRAIN_DAYS = 70
+N_VAL_DAYS = 15
+N_TEST_DAYS = 15
+
+# Training configuration
+BATCH_SIZE = 2
+MAX_EPOCHS = 30
+LEARNING_RATE = 1e-3
+
+# Normalization configuration
+CLIP_PERCENTILE = 99.99
+CLIP_SAMPLE_SIZE = 3000
+
+# Reproducibility
+RANDOM_SEED = 42
+
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+
+
+# ============================================================
+# Load processed MeteoNet data
+# ============================================================
 
 radar = np.load(
-    f"{data_dir}/radar_selected.npy",
+    DATA_DIR / "radar_selected.npy",
     mmap_mode="r"
 )
 
 dates = np.load(
-    f"{data_dir}/radar_dates_selected.npy"
+    DATA_DIR / "radar_dates_selected.npy"
 )
 
 lat = np.load(
-    f"{data_dir}/lat_200.npy"
+    DATA_DIR / "lat_200.npy"
 )
 
 lon = np.load(
-    f"{data_dir}/lon_200.npy"
+    DATA_DIR / "lon_200.npy"
 )
 
 top_100_days = pd.read_csv(
-    f"{data_dir}/top_100_rainy_days.csv",
+    DATA_DIR / "top_100_rainy_days.csv",
     parse_dates=["date"]
 )
 
-import numpy as np
-import pandas as pd
-
 dates_pd = pd.DatetimeIndex(dates)
 
-input_steps = 6
-horizon_steps = 6   # 30 minutes / 5 minutes
 
-target_offset = input_steps - 1 + horizon_steps
-# = 11
+# ============================================================
+# Check loaded data
+# ============================================================
+
+print("\nLoaded dataset")
+print("------------------------")
+print("Radar shape:", radar.shape)
+print("Radar dtype:", radar.dtype)
+print("Date shape:", dates.shape)
+print("Latitude shape:", lat.shape)
+print("Longitude shape:", lon.shape)
+print(
+    "Period:",
+    dates_pd.min(),
+    "to",
+    dates_pd.max()
+)
+
+
+# Check radar dimensions
+if radar.ndim != 3:
+    raise ValueError(
+        f"Expected radar data with 3 dimensions "
+        f"(time, height, width), but got {radar.shape}."
+    )
+
+if radar.shape[1:] != (HEIGHT, WIDTH):
+    raise ValueError(
+        f"Expected radar spatial dimensions "
+        f"{HEIGHT}x{WIDTH}, but got {radar.shape[1:]}."
+    )
+
+if len(radar) != len(dates):
+    raise ValueError(
+        f"Radar/date mismatch: {len(radar)} radar frames "
+        f"and {len(dates)} timestamps."
+    )
+
+if lat.shape != (HEIGHT, WIDTH):
+    raise ValueError(
+        f"Expected latitude grid {(HEIGHT, WIDTH)}, "
+        f"but got {lat.shape}."
+    )
+
+if lon.shape != (HEIGHT, WIDTH):
+    raise ValueError(
+        f"Expected longitude grid {(HEIGHT, WIDTH)}, "
+        f"but got {lon.shape}."
+    )
+
+
+# ============================================================
+# Identify temporally valid sequences
+# ============================================================
+
+# A sequence is valid only when every timestamp from the
+# first input frame through the target frame is separated
+# by exactly five minutes.
+
+expected_delta = np.timedelta64(
+    TIME_INTERVAL_MINUTES,
+    "m"
+)
 
 valid_start_idx = []
 
-for i in range(len(dates) - target_offset):
+for i in range(
+    len(dates_pd) - TARGET_OFFSET
+):
 
-    # timestamps from first input through target
-    sequence_dates = dates_pd[i:i + target_offset + 1]
+    sequence_dates = dates_pd[
+        i:i + TARGET_OFFSET + 1
+    ]
 
-    # Require every adjacent timestamp to be exactly 5 minutes apart
-    diffs = np.diff(sequence_dates.values)
+    diffs = np.diff(
+        sequence_dates.values
+    )
 
     if np.all(
-        diffs == np.timedelta64(5, "m")
+        diffs == expected_delta
     ):
         valid_start_idx.append(i)
 
-valid_start_idx = np.array(
+valid_start_idx = np.asarray(
     valid_start_idx,
     dtype=np.int32
 )
 
-i = valid_start_idx[0]
+if len(valid_start_idx) == 0:
+    raise ValueError(
+        "No temporally continuous radar sequences "
+        "were found."
+    )
 
-# Split data
-# Unique selected days in chronological order
-unique_days = np.sort(
-    np.unique(dates_pd.normalize())
+print(
+    "\nValid sequences:",
+    len(valid_start_idx)
 )
 
 
-train_days = unique_days[:70]
-val_days   = unique_days[70:85]
-test_days  = unique_days[85:100]
+# ============================================================
+# Check an example sequence
+# ============================================================
 
-train_idx = np.array([
-    i for i in valid_start_idx
-    if dates_pd[i].normalize() in train_days
-    and dates_pd[i + 11].normalize() in train_days
-], dtype=np.int32)
+example_idx = valid_start_idx[0]
 
-val_idx = np.array([
-    i for i in valid_start_idx
-    if dates_pd[i].normalize() in val_days
-    and dates_pd[i + 11].normalize() in val_days
-], dtype=np.int32)
+print("\nExample sequence")
+print("------------------------")
 
-test_idx = np.array([
-    i for i in valid_start_idx
-    if dates_pd[i].normalize() in test_days
-    and dates_pd[i + 11].normalize() in test_days
-], dtype=np.int32)
+print("Inputs:")
 
-print("Training:", len(train_idx))
-print("Validation:", len(val_idx))
-print("Testing:", len(test_idx))
+for k in range(INPUT_STEPS):
+    print(
+        f"  Frame {k + 1}:",
+        dates_pd[example_idx + k]
+    )
 
-# train data
+example_target_idx = (
+    example_idx + TARGET_OFFSET
+)
+
+print(
+    "\nTarget:",
+    dates_pd[example_target_idx]
+)
+
+print(
+    "Forecast horizon from final input:",
+    dates_pd[example_target_idx]
+    - dates_pd[
+        example_idx + INPUT_STEPS - 1
+    ]
+)
+
+
+# ============================================================
+# Chronological day-based split
+# ============================================================
+
+# Obtain selected days in chronological order.
+unique_days = np.sort(
+    np.unique(
+        dates_pd.normalize()
+    )
+)
+
+expected_days = (
+    N_TRAIN_DAYS
+    + N_VAL_DAYS
+    + N_TEST_DAYS
+)
+
+if len(unique_days) != expected_days:
+    raise ValueError(
+        f"Expected {expected_days} selected days, "
+        f"but found {len(unique_days)}."
+    )
+
+train_days = unique_days[
+    :N_TRAIN_DAYS
+]
+
+val_days = unique_days[
+    N_TRAIN_DAYS:
+    N_TRAIN_DAYS + N_VAL_DAYS
+]
+
+test_days = unique_days[
+    N_TRAIN_DAYS + N_VAL_DAYS:
+    expected_days
+]
+
+
+# ============================================================
+# Assign sequences to train, validation and test sets
+# ============================================================
+
+def select_sequences_for_days(
+    valid_indices,
+    allowed_days,
+    dates_index,
+    target_offset
+):
+    """
+    Select sequences for which both the first input frame
+    and target frame belong to the specified set of days.
+
+    Parameters
+    ----------
+    valid_indices : array-like
+        Valid sequence starting indices.
+
+    allowed_days : array-like
+        Days assigned to the dataset split.
+
+    dates_index : pandas.DatetimeIndex
+        Radar timestamps.
+
+    target_offset : int
+        Offset between the first input frame and target.
+
+    Returns
+    -------
+    numpy.ndarray
+        Selected sequence starting indices.
+    """
+
+    allowed_days = set(
+        pd.Timestamp(day)
+        for day in allowed_days
+    )
+
+    selected = []
+
+    for i in valid_indices:
+
+        input_day = (
+            dates_index[i].normalize()
+        )
+
+        target_day = (
+            dates_index[
+                i + target_offset
+            ].normalize()
+        )
+
+        if (
+            input_day in allowed_days
+            and target_day in allowed_days
+        ):
+            selected.append(i)
+
+    return np.asarray(
+        selected,
+        dtype=np.int32
+    )
+
+
+train_idx = select_sequences_for_days(
+    valid_indices=valid_start_idx,
+    allowed_days=train_days,
+    dates_index=dates_pd,
+    target_offset=TARGET_OFFSET
+)
+
+val_idx = select_sequences_for_days(
+    valid_indices=valid_start_idx,
+    allowed_days=val_days,
+    dates_index=dates_pd,
+    target_offset=TARGET_OFFSET
+)
+
+test_idx = select_sequences_for_days(
+    valid_indices=valid_start_idx,
+    allowed_days=test_days,
+    dates_index=dates_pd,
+    target_offset=TARGET_OFFSET
+)
+
+
+# ============================================================
+# Check dataset splits
+# ============================================================
+
+print("\nDataset split")
+print("------------------------")
+
+print(
+    f"Training days:   {len(train_days)}"
+)
+
+print(
+    f"Validation days: {len(val_days)}"
+)
+
+print(
+    f"Testing days:    {len(test_days)}"
+)
+
+print()
+
+print(
+    f"Training sequences:   {len(train_idx)}"
+)
+
+print(
+    f"Validation sequences: {len(val_idx)}"
+)
+
+print(
+    f"Testing sequences:    {len(test_idx)}"
+)
+
+
+if len(train_idx) == 0:
+    raise ValueError(
+        "Training split contains no valid sequences."
+    )
+
+if len(val_idx) == 0:
+    raise ValueError(
+        "Validation split contains no valid sequences."
+    )
+
+if len(test_idx) == 0:
+    raise ValueError(
+        "Test split contains no valid sequences."
+    )
+
+
+# ============================================================
+# Determine training frames used to estimate clipping value
+# ============================================================
+
+# Only training data are used to determine the clipping
+# threshold to prevent information leakage from validation
+# or test data.
+
 train_frame_idx = []
 
 for i in train_idx:
-    # 6 input frames
-    train_frame_idx.extend(range(i, i + 6))
 
-    # target frame
-    train_frame_idx.append(i + 11)
+    # Input frames
+    train_frame_idx.extend(
+        range(
+            i,
+            i + INPUT_STEPS
+        )
+    )
+
+    # Target frame
+    train_frame_idx.append(
+        i + TARGET_OFFSET
+    )
 
 train_frame_idx = np.unique(
-    np.array(train_frame_idx, dtype=np.int32)
+    np.asarray(
+        train_frame_idx,
+        dtype=np.int32
+    )
 )
 
-print("Unique training radar frames:", len(train_frame_idx))
+print(
+    "\nUnique training radar frames:",
+    len(train_frame_idx)
+)
 
-# value to clip
-rng = np.random.default_rng(42)
+
+# ============================================================
+# Estimate clipping value from training data
+# ============================================================
+
+rng = np.random.default_rng(
+    RANDOM_SEED
+)
 
 sample_size = min(
-    3000,
+    CLIP_SAMPLE_SIZE,
     len(train_frame_idx)
 )
 
@@ -125,57 +455,121 @@ sample_idx = rng.choice(
     replace=False
 )
 
-sample_values = radar[sample_idx]
+sample_values = radar[
+    sample_idx
+]
 
 clip_value = np.percentile(
     sample_values,
-    99.99
+    CLIP_PERCENTILE
 )
 
-print("Estimated 99.99th percentile:", clip_value)
+clip_value = np.float32(
+    clip_value
+)
 
-def normalize_radar(x, clip_value):
-    x = np.clip(x, 0, clip_value)
+del sample_values
 
-    x = np.log1p(x)
 
-    x = x / np.log1p(clip_value)
+if not np.isfinite(clip_value):
+    raise ValueError(
+        "The estimated clipping value is not finite."
+    )
 
-    return x.astype(np.float32)
-  
-# Create Sequence
+if clip_value <= 0:
+    raise ValueError(
+        f"Invalid clipping value: {clip_value}"
+    )
+
+
+print(
+    f"Estimated {CLIP_PERCENTILE}th "
+    f"percentile:",
+    clip_value
+)
+
+
+# ============================================================
+# Radar sequence generator
+# ============================================================
+
 class RadarSequence(keras.utils.Sequence):
+    """
+    Keras sequence generator for MeteoNet radar forecasting.
+
+    Each sample contains INPUT_STEPS consecutive radar
+    frames and one radar target TARGET_OFFSET frames after
+    the first input frame.
+
+    Normalization is performed on the fly using:
+
+        x_clipped = clip(x, 0, clip_value)
+
+        x_log = log(1 + x_clipped)
+
+        x_normalized =
+            x_log / log(1 + clip_value)
+
+    This maps radar values to approximately [0, 1].
+    """
 
     def __init__(
         self,
         radar,
         start_indices,
         clip_value,
+        input_steps,
+        target_offset,
+        height,
+        width,
         batch_size=2,
         shuffle=False,
+        seed=42,
         **kwargs
     ):
         super().__init__(**kwargs)
 
         self.radar = radar
+
         self.start_indices = np.asarray(
             start_indices,
             dtype=np.int32
         )
 
-        self.clip_value = np.float32(clip_value)
-        self.log_clip = np.log1p(self.clip_value)
+        self.clip_value = np.float32(
+            clip_value
+        )
+
+        self.log_clip = np.log1p(
+            self.clip_value
+        )
+
+        self.input_steps = input_steps
+        self.target_offset = target_offset
+
+        self.height = height
+        self.width = width
 
         self.batch_size = batch_size
         self.shuffle = shuffle
 
+        self.rng = np.random.default_rng(
+            seed
+        )
+
         self.indices = np.arange(
-            len(self.start_indices)
+            len(self.start_indices),
+            dtype=np.int32
         )
 
         self.on_epoch_end()
 
+
     def __len__(self):
+        """
+        Number of batches per epoch.
+        """
+
         return int(
             np.ceil(
                 len(self.start_indices)
@@ -183,7 +577,11 @@ class RadarSequence(keras.utils.Sequence):
             )
         )
 
+
     def normalize(self, x):
+        """
+        Clip and log-normalize radar values.
+        """
 
         x = np.clip(
             x,
@@ -193,13 +591,23 @@ class RadarSequence(keras.utils.Sequence):
 
         x = np.log1p(x)
 
-        x = x / self.log_clip
+        x = (
+            x
+            / self.log_clip
+        )
 
         return x.astype(
             np.float32
         )
 
-    def __getitem__(self, batch_index):
+
+    def __getitem__(
+        self,
+        batch_index
+    ):
+        """
+        Generate one batch.
+        """
 
         start = (
             batch_index
@@ -230,10 +638,10 @@ class RadarSequence(keras.utils.Sequence):
         X = np.empty(
             (
                 current_batch_size,
-                6,
-                200,
-                200,
-                1
+                self.input_steps,
+                self.height,
+                self.width,
+                CHANNELS
             ),
             dtype=np.float32
         )
@@ -243,9 +651,9 @@ class RadarSequence(keras.utils.Sequence):
         y = np.empty(
             (
                 current_batch_size,
-                200,
-                200,
-                1
+                self.height,
+                self.width,
+                CHANNELS
             ),
             dtype=np.float32
         )
@@ -254,14 +662,14 @@ class RadarSequence(keras.utils.Sequence):
             batch_start_idx
         ):
 
-            # Six consecutive input radar frames
+            # Consecutive input radar frames
             input_frames = self.radar[
-                i:i + 6
+                i:i + self.input_steps
             ]
 
-            # 30-minute-ahead target
+            # Forecast target
             target_frame = self.radar[
-                i + 11
+                i + self.target_offset
             ]
 
             # Normalize on the fly
@@ -274,191 +682,406 @@ class RadarSequence(keras.utils.Sequence):
             )
 
             X[j, ..., 0] = input_frames
+
             y[j, ..., 0] = target_frame
 
         return X, y
 
+
     def on_epoch_end(self):
+        """
+        Shuffle training sequence order after each epoch.
+        """
 
         if self.shuffle:
-            np.random.shuffle(
+            self.rng.shuffle(
                 self.indices
             )
 
-# Create Batch
-batch_size = 2
+
+# ============================================================
+# Create generators
+# ============================================================
 
 train_gen = RadarSequence(
     radar=radar,
     start_indices=train_idx,
     clip_value=clip_value,
-    batch_size=batch_size,
-    shuffle=True
+    input_steps=INPUT_STEPS,
+    target_offset=TARGET_OFFSET,
+    height=HEIGHT,
+    width=WIDTH,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    seed=RANDOM_SEED
 )
 
 val_gen = RadarSequence(
     radar=radar,
     start_indices=val_idx,
     clip_value=clip_value,
-    batch_size=batch_size,
-    shuffle=False
+    input_steps=INPUT_STEPS,
+    target_offset=TARGET_OFFSET,
+    height=HEIGHT,
+    width=WIDTH,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    seed=RANDOM_SEED
 )
 
 test_gen = RadarSequence(
     radar=radar,
     start_indices=test_idx,
     clip_value=clip_value,
-    batch_size=batch_size,
-    shuffle=False
+    input_steps=INPUT_STEPS,
+    target_offset=TARGET_OFFSET,
+    height=HEIGHT,
+    width=WIDTH,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    seed=RANDOM_SEED
 )
 
-#check input and target
-i = train_idx[0]
 
-print("Inputs:")
+# ============================================================
+# Check generator output
+# ============================================================
 
-for k in range(6):
-    print(
-        k + 1,
-        dates_pd[i + k]
-    )
+X_sample, y_sample = train_gen[0]
+
+print("\nGenerator check")
+print("------------------------")
 
 print(
-    "\nTarget:",
-    dates_pd[i + 11]
+    "Input shape:",
+    X_sample.shape
 )
 
 print(
-    "\nHorizon from final input:",
-    dates_pd[i + 11]
-    - dates_pd[i + 5]
+    "Target shape:",
+    y_sample.shape
 )
 
-# model
+print(
+    "Input range:",
+    float(X_sample.min()),
+    "to",
+    float(X_sample.max())
+)
 
-model = tf.keras.Sequential([
-    tf.keras.layers.Input(
-        shape=(6, 200, 200, 1)
-    ),
+print(
+    "Target range:",
+    float(y_sample.min()),
+    "to",
+    float(y_sample.max())
+)
 
-    tf.keras.layers.ConvLSTM2D(
-        32,
-        (3, 3),
-        padding="same",
-        return_sequences=True
-    ),
 
-    tf.keras.layers.BatchNormalization(),
+expected_X_shape = (
+    X_sample.shape[0],
+    INPUT_STEPS,
+    HEIGHT,
+    WIDTH,
+    CHANNELS
+)
 
-    tf.keras.layers.ConvLSTM2D(
-        16,
-        (3, 3),
-        padding="same",
-        return_sequences=False
-    ),
+expected_y_shape = (
+    y_sample.shape[0],
+    HEIGHT,
+    WIDTH,
+    CHANNELS
+)
 
-    tf.keras.layers.BatchNormalization(),
-
-    tf.keras.layers.Conv2D(
-        8,
-        (3, 3),
-        padding="same",
-        activation="relu"
-    ),
-
-    tf.keras.layers.Conv2D(
-        1,
-        (1, 1),
-        padding="same",
-        activation="sigmoid"
+if X_sample.shape != expected_X_shape:
+    raise ValueError(
+        f"Unexpected input shape: "
+        f"{X_sample.shape}"
     )
-])
+
+if y_sample.shape != expected_y_shape:
+    raise ValueError(
+        f"Unexpected target shape: "
+        f"{y_sample.shape}"
+    )
+
+del X_sample
+del y_sample
+
+
+# ============================================================
+# Build ConvLSTM model
+# ============================================================
+
+model = keras.Sequential(
+    [
+        keras.layers.Input(
+            shape=(
+                INPUT_STEPS,
+                HEIGHT,
+                WIDTH,
+                CHANNELS
+            )
+        ),
+
+        keras.layers.ConvLSTM2D(
+            filters=32,
+            kernel_size=(3, 3),
+            padding="same",
+            return_sequences=True
+        ),
+
+        keras.layers.BatchNormalization(),
+
+        keras.layers.ConvLSTM2D(
+            filters=16,
+            kernel_size=(3, 3),
+            padding="same",
+            return_sequences=False
+        ),
+
+        keras.layers.BatchNormalization(),
+
+        keras.layers.Conv2D(
+            filters=8,
+            kernel_size=(3, 3),
+            padding="same",
+            activation="relu"
+        ),
+
+        keras.layers.Conv2D(
+            filters=1,
+            kernel_size=(1, 1),
+            padding="same",
+            activation="sigmoid"
+        )
+    ],
+    name="meteonet_convlstm_30min"
+)
 
 model.summary()
 
+
+# ============================================================
+# Compile model
+# ============================================================
+
 model.compile(
     optimizer=keras.optimizers.Adam(
-        learning_rate=1e-3
+        learning_rate=LEARNING_RATE
     ),
     loss="mse",
     metrics=["mae"]
 )
 
+
+# ============================================================
+# Training callbacks
+# ============================================================
+
+best_model_path = (
+    MODEL_DIR
+    / "convlstm_meteonet_30min.keras"
+)
+
 callbacks = [
+
     keras.callbacks.EarlyStopping(
         monitor="val_loss",
         patience=5,
-        restore_best_weights=True
+        restore_best_weights=True,
+        verbose=1
     ),
 
     keras.callbacks.ReduceLROnPlateau(
         monitor="val_loss",
         factor=0.5,
         patience=2,
-        min_lr=1e-6
+        min_lr=1e-6,
+        verbose=1
     ),
 
     keras.callbacks.ModelCheckpoint(
-        "convlstm_meteonet_30min.keras",
+        filepath=best_model_path,
         monitor="val_loss",
-        save_best_only=True
+        save_best_only=True,
+        verbose=1
     )
 ]
+
+
+# ============================================================
+# Train model
+# ============================================================
+
+print("\nTraining model")
+print("------------------------")
 
 history = model.fit(
     train_gen,
     validation_data=val_gen,
-    epochs=30,
+    epochs=MAX_EPOCHS,
     callbacks=callbacks
 )
 
-# Save model
 
-from pathlib import Path
+# ============================================================
+# Save training history and experiment information
+# ============================================================
 
-model_dir = Path("models/convlstm_30min")
-model_dir.mkdir(parents=True, exist_ok=True)
+history_df = pd.DataFrame(
+    history.history
+)
 
-model.save(
-    model_dir / "convlstm_meteonet_30min.keras"
+history_df.insert(
+    0,
+    "epoch",
+    np.arange(
+        1,
+        len(history_df) + 1
+    )
 )
 
 history_df.to_csv(
-    model_dir / "training_history.csv",
+    MODEL_DIR / "training_history.csv",
     index=False
 )
 
+
+# Save clipping threshold
 np.save(
-    model_dir / "clip_value.npy",
-    np.array(clip_value, dtype=np.float32)
+    MODEL_DIR / "clip_value.npy",
+    np.asarray(
+        clip_value,
+        dtype=np.float32
+    )
 )
 
+
+# Save sequence indices
 np.save(
-    model_dir / "train_idx.npy",
+    MODEL_DIR / "train_idx.npy",
     train_idx
 )
 
 np.save(
-    model_dir / "val_idx.npy",
+    MODEL_DIR / "val_idx.npy",
     val_idx
 )
 
 np.save(
-    model_dir / "test_idx.npy",
+    MODEL_DIR / "test_idx.npy",
     test_idx
 )
 
-print("Everything saved to:", model_dir)
 
-# Calculate model accuracy
+# Save day splits
+np.save(
+    MODEL_DIR / "train_days.npy",
+    train_days
+)
 
-def inverse_transform(x, clip_value):
+np.save(
+    MODEL_DIR / "val_days.npy",
+    val_days
+)
 
-    x = np.asarray(x, dtype=np.float32)
+np.save(
+    MODEL_DIR / "test_days.npy",
+    test_days
+)
+
+
+# Save model configuration
+config = pd.DataFrame(
+    {
+        "parameter": [
+            "input_steps",
+            "horizon_steps",
+            "target_offset",
+            "time_interval_minutes",
+            "height",
+            "width",
+            "batch_size",
+            "max_epochs",
+            "initial_learning_rate",
+            "clip_percentile",
+            "clip_sample_size",
+            "random_seed"
+        ],
+
+        "value": [
+            INPUT_STEPS,
+            HORIZON_STEPS,
+            TARGET_OFFSET,
+            TIME_INTERVAL_MINUTES,
+            HEIGHT,
+            WIDTH,
+            BATCH_SIZE,
+            MAX_EPOCHS,
+            LEARNING_RATE,
+            CLIP_PERCENTILE,
+            CLIP_SAMPLE_SIZE,
+            RANDOM_SEED
+        ]
+    }
+)
+
+config.to_csv(
+    MODEL_DIR / "model_config.csv",
+    index=False
+)
+
+
+print(
+    "\nModel and training information saved to:",
+    MODEL_DIR.resolve()
+)
+
+
+# ============================================================
+# Reload best model
+# ============================================================
+
+# ModelCheckpoint saved the model with the lowest validation
+# loss. Reload it explicitly so evaluation always uses the
+# saved best-performing model.
+
+model = keras.models.load_model(
+    best_model_path
+)
+
+
+# ============================================================
+# Inverse normalization
+# ============================================================
+
+def inverse_transform(
+    x,
+    clip_value
+):
+    """
+    Transform normalized radar values back to the original
+    rainfall scale used before normalization.
+
+    Note that values above the training-derived clipping
+    threshold cannot be recovered because they were clipped
+    before normalization.
+    """
+
+    x = np.asarray(
+        x,
+        dtype=np.float32
+    )
 
     return np.expm1(
-        x * np.log1p(clip_value)
+        x
+        * np.log1p(clip_value)
     )
+
+
+# ============================================================
+# Evaluate ConvLSTM and persistence baseline
+# ============================================================
 
 model_se = 0.0
 model_ae = 0.0
@@ -468,20 +1091,45 @@ persistence_ae = 0.0
 
 n_pixels = 0
 
-for batch_number in range(len(test_gen)):
 
-    X_batch, y_batch = test_gen[batch_number]
+print("\nEvaluating test set")
+print("------------------------")
 
-    # ConvLSTM prediction
-    pred_batch = model.predict_on_batch(
-        X_batch
+for batch_number in range(
+    len(test_gen)
+):
+
+    X_batch, y_batch = (
+        test_gen[batch_number]
     )
 
-    # Persistence:
-    # latest observed radar frame
-    persistence_batch = X_batch[:, -1]
+    # --------------------------------------------------------
+    # ConvLSTM forecast
+    # --------------------------------------------------------
 
-    # Back to original radar units
+    pred_batch = (
+        model.predict_on_batch(
+            X_batch
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # Persistence forecast
+    # --------------------------------------------------------
+
+    # Persistence assumes that the latest observed radar
+    # field remains unchanged over the 30-minute forecast
+    # horizon.
+    persistence_batch = (
+        X_batch[:, -1]
+    )
+
+
+    # --------------------------------------------------------
+    # Transform predictions back to rainfall units
+    # --------------------------------------------------------
+
     y_true = inverse_transform(
         y_batch,
         clip_value
@@ -497,8 +1145,14 @@ for batch_number in range(len(test_gen)):
         clip_value
     )
 
+
+    # --------------------------------------------------------
     # ConvLSTM errors
-    diff_model = y_pred - y_true
+    # --------------------------------------------------------
+
+    diff_model = (
+        y_pred - y_true
+    )
 
     model_se += np.sum(
         diff_model ** 2,
@@ -510,9 +1164,14 @@ for batch_number in range(len(test_gen)):
         dtype=np.float64
     )
 
+
+    # --------------------------------------------------------
     # Persistence errors
+    # --------------------------------------------------------
+
     diff_persistence = (
-        y_persistence - y_true
+        y_persistence
+        - y_true
     )
 
     persistence_se += np.sum(
@@ -521,25 +1180,50 @@ for batch_number in range(len(test_gen)):
     )
 
     persistence_ae += np.sum(
-        np.abs(diff_persistence),
+        np.abs(
+            diff_persistence
+        ),
         dtype=np.float64
     )
 
+
+    # Number of evaluated pixels
     n_pixels += y_true.size
 
-    if (batch_number + 1) % 500 == 0:
+
+    if (
+        (batch_number + 1) % 500 == 0
+        or batch_number + 1 == len(test_gen)
+    ):
         print(
+            f"Processed "
             f"{batch_number + 1} / "
             f"{len(test_gen)} batches"
         )
 
 
-model_mse = model_se / n_pixels
-model_rmse = np.sqrt(model_mse)
-model_mae = model_ae / n_pixels
+# ============================================================
+# Calculate evaluation metrics
+# ============================================================
+
+model_mse = (
+    model_se
+    / n_pixels
+)
+
+model_rmse = np.sqrt(
+    model_mse
+)
+
+model_mae = (
+    model_ae
+    / n_pixels
+)
+
 
 persistence_mse = (
-    persistence_se / n_pixels
+    persistence_se
+    / n_pixels
 )
 
 persistence_rmse = np.sqrt(
@@ -547,22 +1231,143 @@ persistence_rmse = np.sqrt(
 )
 
 persistence_mae = (
-    persistence_ae / n_pixels
+    persistence_ae
+    / n_pixels
 )
 
+
+# ============================================================
+# Calculate percentage improvement over persistence
+# ============================================================
+
+mse_improvement = (
+    (
+        persistence_mse
+        - model_mse
+    )
+    / persistence_mse
+    * 100.0
+)
+
+rmse_improvement = (
+    (
+        persistence_rmse
+        - model_rmse
+    )
+    / persistence_rmse
+    * 100.0
+)
+
+mae_improvement = (
+    (
+        persistence_mae
+        - model_mae
+    )
+    / persistence_mae
+    * 100.0
+)
+
+
+# ============================================================
+# Display results
+# ============================================================
+
 print("\nConvLSTM")
-print("----------------")
+print("------------------------")
 print("MSE :", model_mse)
 print("RMSE:", model_rmse)
 print("MAE :", model_mae)
 
 print("\nPersistence")
-print("----------------")
+print("------------------------")
 print("MSE :", persistence_mse)
 print("RMSE:", persistence_rmse)
 print("MAE :", persistence_mae)
 
+print("\nImprovement over persistence")
+print("------------------------")
+print(
+    f"MSE improvement : "
+    f"{mse_improvement:.2f}%"
+)
+
+print(
+    f"RMSE improvement: "
+    f"{rmse_improvement:.2f}%"
+)
+
+print(
+    f"MAE improvement : "
+    f"{mae_improvement:.2f}%"
+)
 
 
+# ============================================================
+# Save evaluation results
+# ============================================================
+
+evaluation_df = pd.DataFrame(
+    {
+        "metric": [
+            "MSE",
+            "RMSE",
+            "MAE"
+        ],
+
+        "ConvLSTM": [
+            model_mse,
+            model_rmse,
+            model_mae
+        ],
+
+        "Persistence": [
+            persistence_mse,
+            persistence_rmse,
+            persistence_mae
+        ],
+
+        "Improvement_percent": [
+            mse_improvement,
+            rmse_improvement,
+            mae_improvement
+        ]
+    }
+)
+
+evaluation_df.to_csv(
+    MODEL_DIR / "test_metrics.csv",
+    index=False
+)
 
 
+# ============================================================
+# Final summary
+# ============================================================
+
+print("\nExperiment complete")
+print("------------------------")
+
+print(
+    "Best model:",
+    best_model_path
+)
+
+print(
+    "Training history:",
+    MODEL_DIR / "training_history.csv"
+)
+
+print(
+    "Test metrics:",
+    MODEL_DIR / "test_metrics.csv"
+)
+
+print(
+    "Clip value:",
+    MODEL_DIR / "clip_value.npy"
+)
+
+print(
+    "Train/validation/test indices saved in:",
+    MODEL_DIR
+)
